@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""SleepFrame — the launcher. This is what the library entry runs, as the ordinary user.
+
+  1. start the space scene (sleepframe.arm64) and wait
+  2. the scene writes the chosen sound's name to a small file when the wind-down begins
+  3. near the end of the wind-down, fade the same sound in here, under the scene's own fade-out
+  4. the scene closes itself; set the screens to zero brightness and keep the sound going
+  5. end on: the select button, the headset off the face for a minute, or the headset having slept
+  6. with a sleep timer: fade the sound out over its last five minutes, then ask the headset to sleep
+
+The power button is never touched. The select button is
+only listened to, never taken: it shares a device with volume up, which must keep working at night.
+If the scene is closed before a sound is chosen, nothing goes dark.
+"""
+import random
+import array, glob, os, select, signal, struct, subprocess, sys, threading, time
+
+try:                                  # gone from Python 3.13 on; used when it is there, because it is quick
+    import audioop
+except ImportError:
+    audioop = None
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+SCENE = os.path.join(HERE, "sleepframe.arm64")
+CHOICE = HOME + "/.local/share/godot/app_userdata/SleepFrame/choice"
+DARK = HOME + "/.local/share/godot/app_userdata/SleepFrame/dark"      # the scene says: I am showing black now
+LOG = HOME + "/.local/share/sleepframe/log"
+BACKLIGHT = "/sys/class/backlight/*/brightness"
+PROXIMITY = "/sys/bus/iio/devices/iio:device*/in_proximity_raw"
+BATTERY = "/sys/class/power_supply/*bat*/capacity"
+FALLBACK_BRIGHTNESS = 257
+PRESENCE_MARK = "UserPresenceDetected to "   # the headset's own worn / not-worn line
+
+# sound name -> (file beside this program, loudness in dB). The dB values match the scene's.
+SOUNDS = {"rain": ("rain.ogg", 2.5), "ocean": ("ocean.ogg", 2.5), "wind": ("wind.ogg", 1.0),
+          "thunder": ("thunder.ogg", 0.0), "white": ("white.wav", -13.5),
+          "pink": ("pink.wav", -11.0), "brown": ("brown.wav", -6.0)}
+MIX_MAX = 3
+MIX_TRIM = (0.0, 0.0, -2.0, -3.5)     # each sound comes down a little as the mix grows; the scene's values
+IN_MEMORY = 250 * 1024 * 1024         # a decoded sound up to this size is held whole, so its loop has no gap
+
+VRCMD = "/opt/steamvr/bin/linuxarm64/vrcmd"   # the headset's own command tool
+HIDE_DASHBOARD_AT = (3.0, 7.0)   # seconds after the scene starts: ask Steam to put its menu away, twice
+
+WIND_DOWN = 10.0          # the scene's wind-down, seconds; it fades its own sound over the last three
+FADE_IN_AT = 6.5          # seconds after the choice that our copy starts to fade in
+FADE_IN = 3.5
+TIMER_FADE = 300.0        # a sleep timer fades the sound out over its last five minutes
+TEST_MINUTE = HOME + "/.local/share/sleepframe/test-minute-seconds"   # testing only: how long a "minute" is
+OFF_FACE_SECONDS = 60
+ASLEEP_JUMP = 30
+RATE, CHANNELS, WIDTH = 48000, 2, 2
+CHUNK = 2400 * CHANNELS * WIDTH       # a twentieth of a second
+
+EVENT = struct.Struct("llHHi")        # struct input_event on 64-bit
+EV_KEY, KEY_SELECT = 1, 353           # the button beside the power button; device "gpio-keys" (heard 10-04)
+SELECT_DEVICE = "gpio-keys"
+
+
+def log(msg):
+    try:                              # a full disk must not be the thing that ends the night
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def read_first(pattern):
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path) as f:
+                return float(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+SCREENS = {"dark": False, "restore": FALLBACK_BRIGHTNESS}
+
+
+def write_brightness(v):
+    """Set the screens. Remembers whether we have them off, for restore_screens()."""
+    wrote = False
+    for path in glob.glob(BACKLIGHT):
+        try:
+            with open(path, "w") as f:
+                f.write(str(int(v)))
+            wrote = True
+        except OSError as e:
+            log(f"could not set the screen brightness ({path}): {e}")
+    if wrote:
+        SCREENS["dark"] = int(v) == 0
+    return wrote
+
+
+def restore_screens():
+    """Whatever way this program ends, screens it turned off are turned back on."""
+    if SCREENS["dark"]:
+        write_brightness(SCREENS["restore"])
+
+
+def battery():
+    v = read_first(BATTERY)
+    return "unknown" if v is None else f"{v:.0f}%"
+
+
+def slept_gap():
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+
+
+def faded(piece, gain):
+    """One piece of 16-bit sound at a fraction of its level. Only fades come through here."""
+    if audioop is not None:
+        return audioop.mul(piece, WIDTH, gain)
+    a = array.array("h")
+    a.frombytes(piece[:len(piece) - len(piece) % 2])
+    return array.array("h", [int(v * gain) for v in a]).tobytes()
+
+
+class Stream:
+    """One continuous stream of sound to the headset's speakers, with a gain we can slide."""
+
+    def __init__(self, path, db):
+        self.path, self.db = path, db          # the level is set once, by the decoder
+        self.gain, self.target, self.step = 0.0, 0.0, 0.0
+        self.alive = True
+        self.error = None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def slide(self, target, seconds):
+        self.target = target
+        self.step = abs(target - self.gain) / max(seconds * RATE * CHANNELS * WIDTH / CHUNK, 1.0)
+
+    def decode(self):
+        return subprocess.Popen(["ffmpeg", "-v", "quiet", "-i", self.path, "-af", f"volume={self.db:.2f}dB",
+                                 "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS), "-"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+
+    def source(self):
+        # ffmpeg decodes the file and sets its level. A file that fits in IN_MEMORY is a loop: it is read
+        # whole (the launcher opens its sounds early, silent, so this is done before they are
+        # heard), begun at a random point, and wrapped from memory without a gap. A longer one
+        # (hours of someone's own recording) is played as it arrives and started again at its end.
+        kept, whole = [], True
+        p = self.decode()
+        self.decoder = p
+        got = 0
+        while self.alive:
+            piece = p.stdout.read(CHUNK * 20)
+            if not piece:
+                break
+            got += len(piece)
+            kept.append(piece)
+            if got > IN_MEMORY:
+                whole = False
+                break
+        if got == 0:
+            raise OSError("could not decode " + self.path)
+        if whole:
+            p.wait()
+            data = b"".join(kept)
+            del kept
+            data = data[:len(data) - len(data) % (CHANNELS * WIDTH)]
+            at = random.randrange(len(data) // (CHANNELS * WIDTH)) * CHANNELS * WIDTH
+            while True:
+                piece = data[at:at + CHUNK]
+                at += CHUNK
+                if len(piece) < CHUNK:
+                    at = CHUNK - len(piece)
+                    piece += data[:at]
+                yield piece
+        for piece in kept:                  # too long to hold: play what was read, then the rest
+            for i in range(0, len(piece), CHUNK):
+                yield piece[i:i + CHUNK]
+        del kept
+        while True:
+            while True:
+                piece = p.stdout.read(CHUNK)
+                if not piece:
+                    break
+                yield piece
+            p.wait()
+            log("the sound reached its end; started it again")
+            p = self.decode()
+            self.decoder = p
+
+    def run(self):
+        self.decoder = None
+        sink = None
+        try:
+            sink = subprocess.Popen(["pw-cat", "--playback", "--raw", "--format", "s16", "--rate", str(RATE),
+                                     "--channels", str(CHANNELS), "-"], stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for piece in self.source():
+                if not self.alive:
+                    break
+                if self.gain < self.target:
+                    self.gain = min(self.target, self.gain + self.step)
+                elif self.gain > self.target:
+                    self.gain = max(self.target, self.gain - self.step)
+                sink.stdin.write(piece if self.gain >= 0.9999 else faded(piece, self.gain))
+        except Exception as e:           # noqa: BLE001 - whatever it was, say so in the log
+            self.error = repr(e)
+        finally:
+            self.alive = False
+            for p in (self.decoder, sink):
+                if p and p.poll() is None:
+                    p.kill()
+
+    def stop(self, fade=1.2):
+        if self.alive and fade > 0:
+            self.slide(0.0, fade)
+            time.sleep(fade + 0.2)
+        self.alive = False
+        p = getattr(self, "decoder", None)
+        if p and p.poll() is None:
+            p.kill()
+        self.thread.join(timeout=3)
+
+
+class Mix:
+    """Up to three streams played together; the headset's own sound system blends them."""
+
+    def __init__(self, names):
+        trim = MIX_TRIM[min(len(names), MIX_MAX)]
+        self.streams = [Stream(os.path.join(HERE, SOUNDS[n][0]), SOUNDS[n][1] + trim) for n in names]
+
+    def slide(self, target, seconds):
+        for s in self.streams:
+            s.slide(target, seconds)
+
+    @property
+    def alive(self):                  # the night goes on while any of them plays
+        return any(s.alive for s in self.streams)
+
+    @property
+    def error(self):
+        return "; ".join(s.error for s in self.streams if s.error) or None
+
+    def stop(self, fade=1.2):
+        if fade > 0:
+            self.slide(0.0, fade)
+            time.sleep(fade + 0.2)
+        for s in self.streams:
+            s.stop(fade=0)
+
+
+def open_mix(chosen, seconds):
+    """The scene's choice is one to three sound names joined by +. Returns a Mix, or False."""
+    names = []
+    for n in chosen.split("+"):
+        if n in names:
+            continue
+        if n in SOUNDS and os.path.isfile(os.path.join(HERE, SOUNDS[n][0])):
+            names.append(n)
+        else:
+            log(f"no sound file for '{n}': left out")
+    names = names[:MIX_MAX]
+    if not names:
+        log("nothing to play: the dark will be silent")
+        return False
+    mix = Mix(names)
+    if seconds is not None:
+        mix.slide(1.0, seconds)
+    return mix
+
+
+def hide_dashboard():
+    """Ask Steam to put its menu away, so nobody has to click into the scene."""
+    try:
+        r = subprocess.run([VRCMD, "--hidedashboard"], env=dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(VRCMD)),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+        return r.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return repr(e)
+
+
+def find_select():
+    for d in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            if open(d + "/device/name").read().strip() == SELECT_DEVICE:
+                return os.open("/dev/input/" + os.path.basename(d), os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+    return None
+
+
+def main():
+    if not os.path.isfile(SCENE):
+        log("refusing to start: no scene at " + SCENE)
+        return 2
+    for old in (CHOICE, DARK):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    power = find_select()
+    if power is None:
+        log("refusing to start: the Aux button was not found, so there would be no way out of the dark")
+        return 2
+    saved = read_first(BACKLIGHT) or 0
+    SCREENS["restore"] = saved if saved > 0 else FALLBACK_BRIGHTNESS
+    went_dark = False
+    env = dict(os.environ, SLEEPFRAME_LAUNCHER="1")
+    scene = subprocess.Popen([SCENE] + sys.argv[1:], cwd=HERE, env=env)
+    log(f"started: scene pid {scene.pid}, battery {battery()}")
+
+    stream, chosen, t_choice, minutes, raised = None, None, None, 0, False
+    t_scene, hides = time.monotonic(), list(HIDE_DASHBOARD_AT)
+    state = {"stop": None}
+
+    def on_signal(signum, _frame):
+        state["stop"] = f"signal {signum}"
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+
+    # ---- the scene is up: wait for a choice, then lay our copy of the sound under its fade-out
+    while scene.poll() is None and state["stop"] is None:
+        time.sleep(0.1)
+        if hides and time.monotonic() - t_scene >= hides[0]:
+            hides.pop(0)
+            log(f"asked Steam to hide its menu: {hide_dashboard()}")
+        if not went_dark and os.path.isfile(DARK):
+            # the scene is showing black: screens off now, before it closes, so Steam's bright
+            # home is never seen on the way down
+            went_dark = True
+            try:
+                write_brightness(0)
+            except OSError as e:
+                log(f"could not darken early: {e}")
+        if chosen is None and os.path.isfile(CHOICE):
+            try:
+                said = open(CHOICE).read().split()
+            except OSError:
+                continue
+            if not said:
+                continue
+            chosen = said[0]
+            try:
+                minutes = int(said[1]) if len(said) > 1 else 0
+            except ValueError:
+                minutes = 0
+            t_choice = time.monotonic()
+            log(f"chosen: {chosen}, {'all night' if minutes == 0 else str(minutes) + ' minutes'}")
+        if chosen and stream is None:
+            stream = open_mix(chosen, None)        # opened silent now, so each sound is read in before it is needed
+        if stream and not raised and time.monotonic() - t_choice >= FADE_IN_AT:
+            raised = True
+            stream.slide(1.0, FADE_IN)
+    if state["stop"]:
+        if went_dark:
+            write_brightness(saved if saved > 0 else FALLBACK_BRIGHTNESS)
+        if scene.poll() is None:
+            scene.terminate()
+        if stream:
+            stream.stop()
+        log("ended: " + state["stop"])
+        return 0
+    if chosen is None:
+        if went_dark:
+            write_brightness(saved if saved > 0 else FALLBACK_BRIGHTNESS)
+        log(f"ended: the scene closed (code {scene.returncode}) before a sound was chosen")
+        return 0
+    if stream is None:                 # the scene closed early, after the choice
+        stream = open_mix(chosen, 1.5)
+    elif stream and not raised:
+        stream.slide(1.0, 1.5)
+
+    # ---- the dark
+    try:                               # presses made during the menus are not a wish to wake
+        while os.read(power, EVENT.size * 64):
+            pass
+    except OSError:
+        pass
+    restore_to = saved if saved > 0 else FALLBACK_BRIGHTNESS
+    follower = None
+    try:
+        follower = subprocess.Popen(["journalctl", "--user", "-f", "-n", "0", "-o", "cat"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        os.set_blocking(follower.stdout.fileno(), False)
+    except OSError:
+        follower = None
+    follow_fd = follower.stdout.fileno() if follower else None
+    follow_buf, said_worn = b"", None
+    face_at_start = read_first(PROXIMITY)
+    sensor_ok = face_at_start is not None and face_at_start >= 20
+    off_since, gap_at_start, t_dark = None, slept_gap(), time.monotonic()
+    minute = read_first(TEST_MINUTE) or 60.0
+    t_end = t_dark + minutes * minute if minutes > 0 else None
+    fading, timer_done = False, False
+    write_brightness(0)
+    log(f"dark: {chosen}, brightness was {saved:.0f}, listening for the Aux button, battery {battery()}, "
+        f"face sensor {face_at_start}, headset's own word {'followed' if follower else 'not available'}")
+
+    reason = None
+    try:
+        while reason is None:
+            watch = [power] + ([follow_fd] if follow_fd is not None else [])
+            ready, _, _ = select.select(watch, [], [], 1.0)
+            for fd in ready:
+                if fd == follow_fd:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        follow_fd, said_worn = None, None
+                        continue
+                    follow_buf += chunk
+                    *lines, follow_buf = follow_buf.split(b"\n")
+                    for line in lines:
+                        at = line.find(PRESENCE_MARK.encode())
+                        if at >= 0:
+                            word = line[at + len(PRESENCE_MARK):at + len(PRESENCE_MARK) + 1]
+                            if word in (b"0", b"1"):
+                                said_worn = word == b"1"
+                    continue
+                try:
+                    data = os.read(fd, EVENT.size * 32)
+                except OSError:
+                    continue
+                for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, etype, code, value = EVENT.unpack_from(data, off)
+                    if etype == EV_KEY and code == KEY_SELECT and value == 1 and time.monotonic() - t_dark > 1.0:
+                        reason = "Aux button"
+            if state["stop"]:
+                reason = state["stop"]
+            if reason is None and slept_gap() - gap_at_start > ASLEEP_JUMP:
+                reason = "the headset had been asleep"
+            if said_worn is not None:
+                worn = said_worn
+            elif sensor_ok:
+                now_face = read_first(PROXIMITY)
+                worn = now_face is None or now_face >= face_at_start / 2
+            else:
+                worn = True
+            if worn:
+                off_since = None
+            elif off_since is None:
+                off_since = time.monotonic()
+            elif reason is None and time.monotonic() - off_since >= OFF_FACE_SECONDS:
+                reason = "headset taken off"
+            try:                                   # hold the dark
+                if (read_first(BACKLIGHT) or 0) != 0:
+                    write_brightness(0)
+            except OSError:
+                pass
+            if t_end is not None and not timer_done:
+                now = time.monotonic()
+                if not fading and now >= t_end - min(TIMER_FADE, (t_end - t_dark) * 0.5):
+                    fading = True
+                    if stream:
+                        stream.slide(0.0, max(t_end - now, 1.0))
+                    log("sleep timer: fading the sound out")
+                if now >= t_end:
+                    timer_done = True
+                    if stream:
+                        stream.stop(fade=0)
+                    # the screens stay dark; ask the headset to sleep. When it is woken, the check
+                    # above sees that it slept, and we end and give the screens back.
+                    try:
+                        rc = subprocess.run(["systemctl", "suspend"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, timeout=20).returncode
+                    except (OSError, subprocess.TimeoutExpired) as e:
+                        rc = repr(e)
+                    log(f"sleep timer reached, battery {battery()}: asked the headset to sleep ({rc})")
+            if stream and not stream.alive and reason is None and not timer_done:
+                reason = f"the sound stopped ({stream.error})"
+
+        log(f"waking: {reason}")
+    finally:
+        try:
+            write_brightness(restore_to)
+        except OSError as e:
+            log(f"could not restore brightness: {e}")
+        if stream:
+            stream.stop()
+        if follower and follower.poll() is None:
+            follower.kill()
+    log(f"ended, battery {battery()}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        code = main()
+    finally:
+        restore_screens()             # on every way out, including one nobody foresaw
+    sys.exit(code)

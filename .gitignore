@@ -1,0 +1,8 @@
+.godot/
+*.part
+__pycache__/
+build/
+raw/
+loops/*.flac
+loops/*.ogg
+looks/
