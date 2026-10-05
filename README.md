@@ -69,7 +69,7 @@ The three noises are made by `noise/make_noise.py` and verified by `noise/check_
 
 ## What it keeps on the headset
 
-Three small files, all on the headset and nowhere else: your last mix and timer (so *as before* works); the launcher's log of when it started, what was chosen and how it ended, with the battery level; and the frame rate of the most recent run. SleepFrame does not record where you look. It sends nothing anywhere.
+Three small files, all on the headset and nowhere else: your last mix and timer (so *as before* works); the launcher's log of when it started, what was chosen and how it ended, with the battery level; and the frame rate of the most recent run. It also copies its four library pictures into Steam's artwork folder, once. SleepFrame does not record where you look. It sends nothing anywhere.
 
 ## Design notes
 
@@ -82,7 +82,7 @@ Three small files, all on the headset and nowhere else: your last mix and timer 
 
 You need a PC on the same network as the headset, and Valve's free **SteamOS Devkit Client** (in your Steam library under Tools).
 
-1. Download `SleepFrame-0.1.0.zip` from this repository's Releases page and unzip it. It is about 190 MB to download and 250 MB unzipped.
+1. Download `SleepFrame-0.1.1.zip` from this repository's Releases page and unzip it. It is about 190 MB to download and 250 MB unzipped.
 2. On the headset: **Settings → System → Developer Mode** on, then **Settings → Developer → Pair new host**.
 3. On the PC, open the SteamOS Devkit Client, find the headset under **Devkits** (or connect by the name `frame`), and confirm the pairing on the headset.
 4. Open **Title Upload** and fill in:
@@ -92,7 +92,7 @@ You need a PC on the same network as the headset, and Valve's free **SteamOS Dev
    - **Runtime:** `Not specified`
 5. Press **Upload**. SleepFrame then appears on the headset under **Library → Non-Steam → Devkit Game: SleepFrame**.
 
-`icon.png` is in the folder if you want to give SleepFrame a picture of its own in your library.
+Valve's tool gives a title no picture, so the first time SleepFrame runs it gives itself one: it copies four small pictures from its `artwork` folder into Steam's own artwork folder, under its own title's number. The picture shows in your library after SteamVR next restarts. It never replaces a picture that is already there.
 
 These steps follow Valve's documentation for the tool. SleepFrame itself was installed and tested with the same tool's command-line scripts rather than its window, so if a step above does not match what you see, please open an issue.
 
@@ -111,7 +111,7 @@ Everything the program loads at run time sits in one folder beside it. From a fr
    godot --headless --path game --export-release "Steam Frame Arm64" ../build/sleepframe.arm64
    ```
    That writes `sleepframe.arm64` and `sleepframe.pck`.
-2. **The launcher** is `launcher/sleepframe`, a Python script with no dependencies beyond what SteamOS already has (`ffmpeg`, `pw-cat`). Copy it into `build/`.
+2. **The launcher** is `launcher/sleepframe`, a Python script with no dependencies beyond what SteamOS already has (`ffmpeg`, `pw-cat`). Copy it into `build/`, and copy the `artwork` folder beside it.
 3. **The noises:** `python3 noise/make_noise.py build`, then `python3 noise/check_noise.py build` to verify them.
 4. **The recordings:** download the four originals named in `sounds/SOURCES.tsv` (the rows for sounds 2570, 1451 and 2719 on BigSoundBank and 454128 on Freesound) into `sounds/raw/` under the file names in the first column, then
    ```

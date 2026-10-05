@@ -13,7 +13,7 @@ only listened to, never taken: it shares a device with volume up, which must kee
 If the scene is closed before a sound is chosen, nothing goes dark.
 """
 import random
-import array, glob, os, select, signal, struct, subprocess, sys, threading, time
+import array, glob, os, select, shutil, signal, struct, subprocess, sys, threading, time
 
 try:                                  # gone from Python 3.13 on; used when it is there, because it is quick
     import audioop
@@ -268,6 +268,39 @@ def open_mix(chosen, seconds):
     return mix
 
 
+# picture beside this program -> its name in Steam's artwork folder, for this title's id
+ARTWORK = {"tall.png": "{id}p.png", "wide.png": "{id}.png", "banner.png": "{id}_hero.png", "icon.png": "{id}_icon.png"}
+
+
+def install_artwork():
+    """Give SleepFrame a picture in the library.
+
+    Valve's devkit tool has no way to set one, so a title installed with it is a blank tile.
+    Steam does look in its own artwork folder for pictures named after a title's id, and it
+    tells every program it starts what that id is. So the first time we run, we copy our four
+    pictures there. Never overwritten, never required: if anything here fails, the night goes on.
+    """
+    appid = os.environ.get("SteamAppId", "")
+    src = os.path.join(HERE, "artwork")
+    if not appid.isdigit() or int(appid) == 0 or not os.path.isdir(src):
+        return
+    placed = 0
+    try:
+        for conf in glob.glob(HOME + "/.local/share/Steam/userdata/*/config"):
+            grid = os.path.join(conf, "grid")
+            os.makedirs(grid, exist_ok=True)
+            for name, pattern in ARTWORK.items():
+                ours, theirs = os.path.join(src, name), os.path.join(grid, pattern.format(id=appid))
+                if os.path.isfile(ours) and not os.path.exists(theirs):
+                    shutil.copyfile(ours, theirs + ".part")      # whole or not at all
+                    os.replace(theirs + ".part", theirs)
+                    placed += 1
+    except OSError as e:
+        log(f"could not place the library pictures: {e}")
+    if placed:
+        log(f"placed {placed} library picture(s) for this title; they show after SteamVR next restarts")
+
+
 def hide_dashboard():
     """Ask Steam to put its menu away, so nobody has to click into the scene."""
     try:
@@ -301,6 +334,7 @@ def main():
     if power is None:
         log("refusing to start: the Aux button was not found, so there would be no way out of the dark")
         return 2
+    install_artwork()
     saved = read_first(BACKLIGHT) or 0
     SCREENS["restore"] = saved if saved > 0 else FALLBACK_BRIGHTNESS
     went_dark = False
